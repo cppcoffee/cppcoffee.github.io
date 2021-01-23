@@ -1,6 +1,10 @@
 ---
 layout: post
 title:  "《Getting Started with Varnish Cache》读书笔记-缓存相关"
+subtitle: ""
+description: "Getting Started with Varnish Cache 读书笔记 缓存相关"
+date: 2021-01-09
+author: "Sharp Liu"
 categories: httpcache
 ---
 {{ page.title }}
