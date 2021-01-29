@@ -24,7 +24,7 @@ author: Sharp Liu
 description: >- # this means to ignore newlines until "baseurl:"
   Rustacean🦀 路漫漫其修远兮，吾将上下而求索
 baseurl: "" # the subpath of your site, e.g. /blog
-url: "cppcoffee.github.io"
+url: "https://cppcoffee.github.io"
 twitter_username: cppcoffee
 github_username:  cppcoffee
 
