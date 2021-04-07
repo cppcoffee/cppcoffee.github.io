@@ -8,7 +8,10 @@ author: "Sharp Liu"
 categories: datastructure
 ---
 
-## {{ page.title }}
+{{ page.title }}
+
+
+## 无锁队列
 
 队列是一种FIFO的抽象数据结构，这里提到的无锁队列实现是 `Implementing Lock-Free Queues(1994)` 这篇论文提出来的。
 

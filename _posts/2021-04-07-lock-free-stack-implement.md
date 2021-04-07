@@ -8,7 +8,7 @@ author: "Sharp Liu"
 categories: datastructure
 ---
 
-## {{ page.title }}
+{{ page.title }}
 
 ### 无锁链式栈
 
