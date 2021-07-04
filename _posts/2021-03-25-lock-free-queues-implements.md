@@ -8,10 +8,7 @@ author: "Sharp Liu"
 categories: datastructure
 ---
 
-{{ page.title }}
-
-
-## 无锁队列
+## {{ page.title }}
 
 队列是一种FIFO的抽象数据结构，这里提到的无锁队列实现是 `Implementing Lock-Free Queues(1994)` 这篇论文提出来的。
 
@@ -83,7 +80,7 @@ int queue_init(queue_t *q)
 ```c
 int enqueue(queue_t *q, void *x)
 {
-    node_t  *node, *p;
+    node_t  *node, *tail, *next;
 
     node = (node_t *) malloc(sizeof(node_t));
     if (node == NULL) {
@@ -94,22 +91,23 @@ int enqueue(queue_t *q, void *x)
     node->next = NULL;
 
     for ( ;; ) {
-        p = q->tail;
+        tail = q->tail;
+        next = tail->next;
 
-        // tail->next == NULL, 加入新 node.
-        if (__sync_bool_compare_and_swap(&(p->next), NULL, node)) {
-            break;
+        if (tail != q->tail) {
+            continue;
+        }
+
+        if (next == NULL) {
+            if (__sync_bool_compare_and_swap(&(tail->next), next, node)) {
+                __sync_bool_compare_and_swap(&(q->tail), tail, node);
+                return 0;
+            }
 
         } else {
-            // tail 指针被修改了，步进 tail.
-            __sync_bool_compare_and_swap(&(q->tail), p, p->next);
+            __sync_bool_compare_and_swap(&(q->tail), tail, next);
         }
     }
-
-    // 操作完毕，设置 tail 指针.
-    __sync_bool_compare_and_swap(&(q->tail), p, node);
-
-    return 0;
 }
 ```
 
@@ -121,92 +119,142 @@ int enqueue(queue_t *q, void *x)
 ```c
 void *dequeue(queue_t *q)
 {
-    node_t  *p;
     void    *v;
+    node_t  *head, *tail, *next;
 
     for ( ;; ) {
-        p = q->head;
+        head = q->head;
+        tail = q->tail;
+        next = head->next;
 
-        // 队列空.
-        if (p->next == NULL) {
-            return NULL;
+        if (head != q->head) {
+            continue;
         }
 
-        // 设置 head 指向下一个 node
-        if (__sync_bool_compare_and_swap(&(q->head), p, p->next)) {
-            break;
+        if (head == tail) {
+            if (next == NULL) {
+                return NULL;
+            }
+
+            __sync_bool_compare_and_swap(&(q->tail), tail, next);
+
+        } else {
+            if (next == NULL) {
+                continue;
+            }
+
+            v = next->value;
+
+            if (__sync_bool_compare_and_swap(&(q->head), head, next)) {
+                // FIXME: 释放会引发并发结构经典的 ABA 和内存回收问题
+                //free(head);
+                return v;
+            }
         }
     }
-
-    v = p->next->value;
-
-    free(p);
-
-    return v;
 }
 ```
 
 
+### ABA 问题
+
+在多线程中，ABA 问题发生在同步期间，当一个位置被读取两次，两次读取的值都是一样的，“值是一样的”被用来表示“没有变化”。然而，另一个线程可以在两次读取之间执行，并改变值，做其他工作，然后把值改回来，从而欺骗第一个线程，使其认为“没有变化”，即使第二个线程所做的工作违反了这个假设：
+
+```
+T1 从共享内存中读取 A=Load(A) 后被暂停
+T2 被调度执行
+T2 修改共享内存 CAS(A, B) 将 A 修改成 B，并在被系统调度前 CAS(B, A） B 再被修改成 A
+T1 再次被调度执行，从而看到 A 并没有被改变过
+```
+
+这需要保证内存不能立即释放（还有线程饮用它），也不能立即被重用，这就是无锁结构 CAS 最常见的坑，实际项目中，通常配合 128 位 CAS 来避免 ABA 问题，而支持 128 位 CAS 的硬件并不通用，所以需要做指针压缩(TaggedPointer)
+
+
+#### Tagged Pointer
+
+在 x86_64 机器上，指针高位地址用于在内核层表示，在应用层空间中就能够使用高位地址来作为 tag。
+
+如下是 64 位长度的地址：
+
+```
+0000 0000 0000 0000
+```
+
+根据 linux mm 文档中描述，应用程序虚拟内存范围是 0000000000000000 - 00007fffffffffff
+
+也就是说高 16 位是可以用来作为 tag.
+
+```
+0000 FFFF FFFF FFFF
+^^^^
+Free Data!
+```
+
+
+### 内存回收问题
+
+在多线程操作中，内存不能直接释放，由于有其他线程在访问它，这样会造成 **释放后访问** 的问题：
+
+> T1 执行到 next = tail->next; 时被调度走
+> T2 执行 dequeue，将 tail 指向的内存释放
+> T1 再次被调度到，此时访问 tail->next 将造成 内存释放后再访问的问题
+
+这种情况需要保证内存访问的安全性，可以使用 引用计数、hazard pointers 和 epoch based reclamation 等内存延迟回收算法。
+
+
 ### Rust 实现
 
-最后附上一版使用 Rust 实现无锁队列的完整代码
+最后附上一版使用 Rust 实现无锁队列的完整代码，这里使用 **crossbeam_epoch** crate 来解决 ABA 问题和内存回收问题。
 
 lib.rs
 
 ```rust
-use std::ptr;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+
+use crossbeam_epoch::{self as epoch, Atomic, Owned, Shared};
 
 unsafe impl<T: Send> Sync for Queue<T> {}
 
 struct Node<T: Send> {
-    next: AtomicPtr<Node<T>>,
-    value: Option<T>,
+    next: Atomic<Node<T>>,
+    data: Option<T>,
 }
 
 impl<T: Send> Node<T> {
     fn new(v: T) -> Self {
         Self {
             next: Default::default(),
-            value: Some(v),
+            data: Some(v),
         }
     }
 
     fn sentinel() -> Self {
         Self {
-            next: Default::default(),
-            value: None,
+            next: Atomic::null(),
+            data: None,
         }
     }
 }
 
 pub struct Queue<T: Send> {
-    head: AtomicPtr<Node<T>>,
-    tail: AtomicPtr<Node<T>>,
-}
-
-impl<T: Send> Drop for Queue<T> {
-    fn drop(&mut self) {
-        let mut p = self.head.load(Ordering::Relaxed);
-
-        while !p.is_null() {
-            unsafe {
-                let next = (*p).next.load(Ordering::Relaxed);
-                Box::from_raw(p);
-                p = next;
-            }
-        }
-    }
+    head: Atomic<Node<T>>,
+    tail: Atomic<Node<T>>,
 }
 
 impl<T: Send> Queue<T> {
     pub fn new() -> Self {
-        let dummy_ptr = Box::into_raw(Box::new(Node::sentinel()));
+        let q = Queue {
+            head: Atomic::null(),
+            tail: Atomic::null(),
+        };
+        let sentinel = Owned::new(Node::sentinel());
 
-        Self {
-            head: AtomicPtr::new(dummy_ptr),
-            tail: AtomicPtr::new(dummy_ptr),
-        }
+        let guard = unsafe { &epoch::unprotected() };
+
+        let sentinel = sentinel.into_shared(guard);
+        q.head.store(sentinel, Relaxed);
+        q.tail.store(sentinel, Relaxed);
+        q
     }
 
     pub fn enq(&self, v: T) {
@@ -214,26 +262,26 @@ impl<T: Send> Queue<T> {
     }
 
     unsafe fn try_enq(&self, v: T) {
-        let node = Box::into_raw(Box::new(Node::new(v)));
+        let guard = &epoch::pin();
+        let node = Owned::new(Node::new(v)).into_shared(guard);
 
         loop {
-            let p = self.tail.load(Ordering::Acquire);
+            let p = self.tail.load(Acquire, guard);
 
-            if (*p)
+            if (*p.as_raw())
                 .next
-                .compare_exchange(ptr::null_mut(), node, Ordering::Release, Ordering::Relaxed)
+                .compare_exchange(Shared::null(), node, Release, Relaxed, guard)
                 .is_ok()
             {
-                let _ = self
-                    .tail
-                    .compare_exchange(p, node, Ordering::Acquire, Ordering::Relaxed);
+                let _ = self.tail.compare_exchange(p, node, Release, Relaxed, guard);
                 return;
             } else {
                 let _ = self.tail.compare_exchange(
                     p,
-                    (*p).next.load(Ordering::Acquire),
-                    Ordering::Release,
-                    Ordering::Relaxed,
+                    (*p.as_raw()).next.load(Acquire, guard),
+                    Release,
+                    Relaxed,
+                    guard,
                 );
             }
         }
@@ -244,12 +292,12 @@ impl<T: Send> Queue<T> {
     }
 
     unsafe fn try_deq(&self) -> Option<T> {
-        let mut p;
+        let guard = &epoch::pin();
 
         loop {
-            p = self.head.load(Ordering::Acquire);
+            let p = self.head.load(Acquire, guard);
 
-            if (*p).next.load(Ordering::Acquire).is_null() {
+            if (*p.as_raw()).next.load(Acquire, guard).is_null() {
                 return None;
             }
 
@@ -257,17 +305,17 @@ impl<T: Send> Queue<T> {
                 .head
                 .compare_exchange(
                     p,
-                    (*p).next.load(Ordering::Acquire),
-                    Ordering::Release,
-                    Ordering::Relaxed,
+                    (*p.as_raw()).next.load(Acquire, guard),
+                    Release,
+                    Relaxed,
+                    guard,
                 )
                 .is_ok()
             {
-                break;
+                let next = (*p.as_raw()).next.load(Acquire, guard).as_raw() as *mut Node<T>;
+                return (*next).data.take();
             }
         }
-
-        (*(*p).next.load(Ordering::Acquire)).value.take()
     }
 }
 ```
@@ -331,6 +379,7 @@ fn queue_thread_n_m(n: u32, m: u32) -> Duration {
 ```
 
 
+
 #### 结果对比
 
 笔记本电脑 CPU 参数如下:
@@ -361,7 +410,17 @@ machdep.cpu.thread_count: 4
 
 [Implementing Lock-Free Queues (1994)](http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.53.8674)
 
+[https://en.wikipedia.org/wiki/ABA_problem](https://en.wikipedia.org/wiki/ABA_problem)
+
 [https://gcc.gnu.org/onlinedocs/gcc/_005f_005fatomic-Builtins.html](https://gcc.gnu.org/onlinedocs/gcc/_005f_005fatomic-Builtins.html)
+
+[Keir Fraser’s epoch-based reclamation](https://www.cl.cam.ac.uk/techreports/UCAM-CL-TR-579.pdf)
+
+[crossbeam-epoch crate](https://lib.rs/crates/crossbeam-epoch)
+
+[https://en.wikipedia.org/wiki/Tagged_pointer](https://en.wikipedia.org/wiki/Tagged_pointer)
+
+[https://www.kernel.org/doc/Documentation/x86/x86_64/mm.txt](https://www.kernel.org/doc/Documentation/x86/x86_64/mm.txt)
 
 [https://github.com/cppcoffee/queue-rs](https://github.com/cppcoffee/queue-rs)
 
