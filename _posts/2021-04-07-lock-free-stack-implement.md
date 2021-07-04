@@ -8,7 +8,7 @@ author: "Sharp Liu"
 categories: datastructure
 ---
 
-{{ page.title }}
+## {{ page.title }}
 
 ### 无锁链式栈
 
@@ -21,6 +21,9 @@ categories: datastructure
 
 ### 实现
 
+这里采用 Rust 实现，**crossbeam-epoch** crate 来解决无锁结构体的 ABA 问题和内存回收问题。
+
+
 #### 结构体
 
 栈的结构体需要有一个指针指向当前栈的栈顶，由于只需要原子操作一个栈顶指针，实现起来将会变得简单。
@@ -29,28 +32,39 @@ categories: datastructure
 
 ```c
 // 链式栈节点结构体
-typedef struct node_s  node_t;
-struct node_s {
-    node_t  *next;  // 下一个栈节点
-    void    *value; // 存储的值
-};
+struct Node<T: Send> {
+    next: Atomic<Node<T>>,  // 下一个节点
+    value: Option<T>,       // 存储的值
+}
 
-// 链式栈结构体
-typedef struct stack_s  stack_t;
-struct stack_s {
-    node_t  *top;   // 永远指向栈顶的指针
-};
+// 栈对象结构体
+pub struct Stack<T: Send> {
+    top: Atomic<Node<T>>,
+}
 ```
 
 
 #### 初始化
 
-初始化不需要原子操作，直接将栈顶指针设置为空：
+初始化不需要原子操作，这里提供两个方法：
 
 ```c
-void stack_init(stack_t *s)
-{
-    s->top = NULL;
+impl<T: Send> Node<T> {
+    // 普通节点
+    fn new(v: T) -> Self {
+        Self {
+            next: Atomic::null(),
+            value: Some(v),
+        }
+    }
+
+    // 哨兵节点
+    fn sentinel() -> Self {
+        Self {
+            next: Atomic::null(),
+            value: None,
+        }
+    }
 }
 ```
 
@@ -60,24 +74,25 @@ void stack_init(stack_t *s)
 压栈操作是将栈顶指针设置为新压入的栈节点。
 
 ```c
-int stack_push(stack_t *s, void *x)
-{
-    node_t  *node, *p;
+pub fn push(&self, v: T) {
+    unsafe { self.try_push(v) }
+}
 
-    node = (node_t *) malloc(sizeof(node_t));
-    if (node == NULL) {
-        return -ENOMEM;
-    }
+unsafe fn try_push(&self, v: T) {
+    let guard = &epoch::pin();
+    let node = Owned::new(Node::new(v)).into_shared(guard);
 
-    node->value = x;
+    loop {
+        let top_ptr = self.top.load(Acquire, guard);
+        // 新节点的下一个节点指向栈顶
+        (*node.as_raw()).next.store(top_ptr, Relaxed);
 
-    for ( ;; ) {
-        p = s->top;
-        // 新栈节点的下一个栈是栈顶
-        node->next = p;
-
-        // 设置 top 指针为新节点
-        if (__sync_bool_compare_and_swap(&(s->top), p, node)) {
+        // 设置 top 为新节点
+        if self
+            .top
+            .compare_exchange(top_ptr, node, Release, Relaxed, guard)
+            .is_ok()
+        {
             break;
         }
     }
@@ -90,136 +105,35 @@ int stack_push(stack_t *s, void *x)
 出栈操作是将栈顶指针设置为栈顶的下一个栈节点
 
 ```c
-void *stack_pop(stack_t *s)
-{
-    node_t  *p;
-    void    *v;
+pub fn pop(&self) -> Option<T> {
+    unsafe { self.try_pop() }
+}
 
-    for ( ;; ) {
-        p = s->top;
+unsafe fn try_pop(&self) -> Option<T> {
+    let guard = &epoch::pin();
 
-        if (p == NULL) {
-            return NULL;
+    loop {
+        let top_ptr = self.top.load(Acquire, guard);
+        let next_ptr = (*top_ptr.as_raw()).next.load(Acquire, guard);
+
+        if next_ptr.is_null() {
+            return None;
         }
 
         // 设置栈顶指针为栈顶的下一个栈节点
-        if (__sync_bool_compare_and_swap(&(s->top), p, p->next)) {
-            break;
+        if self
+            .top
+            .compare_exchange(top_ptr, next_ptr, Release, Relaxed, guard)
+            .is_ok()
+        {
+            let top_ptr = top_ptr.as_raw() as *mut Node<T>;
+            return (*top_ptr).value.take();
         }
     }
-
-    v = p->value;
-
-    free(p);
-
-    return v;
 }
 ```
-
-
-### Rust 实现
 
 完整代码链接放在文末 **参考** 字段
-
-```
-use std::sync::atomic::{AtomicPtr, Ordering};
-
-unsafe impl<T: Send> Sync for Stack<T> {}
-
-struct Node<T: Send> {
-    next: AtomicPtr<Node<T>>,
-    value: Option<T>,
-}
-
-impl<T: Send> Node<T> {
-    fn new(x: T) -> Self {
-        Self {
-            next: AtomicPtr::default(),
-            value: Some(x),
-        }
-    }
-
-    fn sentry() -> Self {
-        Self {
-            next: AtomicPtr::default(),
-            value: None,
-        }
-    }
-}
-
-pub struct Stack<T: Send> {
-    top: AtomicPtr<Node<T>>,
-}
-
-impl<T: Send> Stack<T> {
-    pub fn new() -> Self {
-        let dummy = Box::into_raw(Box::new(Node::sentry()));
-
-        Stack {
-            top: AtomicPtr::new(dummy),
-        }
-    }
-
-    pub fn push(&self, x: T) {
-        unsafe { self.try_push(x) }
-    }
-
-    unsafe fn try_push(&self, x: T) {
-        let node = Box::leak(Box::new(Node::new(x)));
-
-        loop {
-            let top_ptr = self.top.load(Ordering::Acquire);
-            node.next.store(top_ptr, Ordering::Relaxed);
-
-            if self
-                .top
-                .compare_exchange(top_ptr, node, Ordering::Release, Ordering::Relaxed)
-                .is_ok()
-            {
-                break;
-            }
-        }
-    }
-
-    pub fn pop(&self) -> Option<T> {
-        unsafe { self.try_pop() }
-    }
-
-    unsafe fn try_pop(&self) -> Option<T> {
-        loop {
-            let top_ptr = self.top.load(Ordering::Acquire);
-            let next_ptr = (*top_ptr).next.load(Ordering::Acquire);
-
-            if next_ptr.is_null() {
-                return None;
-            }
-
-            if self
-                .top
-                .compare_exchange(top_ptr, next_ptr, Ordering::Release, Ordering::Relaxed)
-                .is_ok()
-            {
-                let mut node = Box::from_raw(top_ptr);
-                return node.value.take();
-            }
-        }
-    }
-}
-
-impl<T: Send> Drop for Stack<T> {
-    fn drop(&mut self) {
-        let mut p = self.top.load(Ordering::Relaxed);
-
-        while !p.is_null() {
-            unsafe {
-                let next = (*p).next.load(Ordering::Relaxed);
-                Box::from_raw(p);
-                p = next;
-            }
-        }
-    }
-}
-```
 
 
 ### 性能测试
@@ -262,6 +176,8 @@ stack_thread_n_m(n, m)：同一个 stack 对象， n 个线程入栈和出栈，
 [Implementing Lock-Free Queues (1994)](http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.53.8674)
 
 [https://gcc.gnu.org/onlinedocs/gcc/_005f_005fatomic-Builtins.html](https://gcc.gnu.org/onlinedocs/gcc/_005f_005fatomic-Builtins.html)
+
+[https://lib.rs/crates/crossbeam-epoch](https://lib.rs/crates/crossbeam-epoch)
 
 [https://github.com/cppcoffee/stack-rs](https://github.com/cppcoffee/stack-rs)
 
