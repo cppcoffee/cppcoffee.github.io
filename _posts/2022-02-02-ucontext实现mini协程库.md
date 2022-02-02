@@ -226,7 +226,10 @@ coroutine_yield(coroutine_t *co)
 ## References
 
 [https://github.com/cppcoffee/coroutine](https://github.com/cppcoffee/coroutine)
+
 [https://man7.org/linux/man-pages/man3/swapcontext.3.html](https://man7.org/linux/man-pages/man3/swapcontext.3.html)
+
 [https://github.com/cloudwu/coroutine](https://github.com/cloudwu/coroutine)
+
 [https://rethinkdb.com/blog/making-coroutines-fast/](https://rethinkdb.com/blog/making-coroutines-fast/)
 
