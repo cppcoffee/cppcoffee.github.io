@@ -1,8 +1,8 @@
 ---
 layout: post
-title:  "ucontext实现mini协程库"
+title:  "ucontext实现mini协程库与优化"
 subtitle: ""
-description: "ucontext实现mini协程库"
+description: "ucontext实现mini协程库与优化"
 date: 2022-02-02
 author: "Sharp Liu"
 categories: system program
@@ -221,6 +221,170 @@ coroutine_yield(coroutine_t *co)
 1. 移除 `swapcontext` 内部调用设置的 `sig_flags` API 操作
 2. 移除参数寄存器 (x64 上面是 RDI, RDX, RCX, R8, R9 and RSI) 操作
 3. 移除浮点数寄存器操作
+
+
+### ucontext_i.h
+
+定义寄存器存储的偏移量
+
+```c
+#define SIG_BLOCK 0
+#define SIG_SETMASK 2
+#define _NSIG8 8
+#define oRBP 120
+#define oRSP 160
+#define oRBX 128
+#define oR8 40
+#define oR9 48
+#define oR10 56
+#define oR11 64
+#define oR12 72
+#define oR13 80
+#define oR14 88
+#define oR15 96
+#define oRDI 104
+#define oRSI 112
+#define oRDX 136
+#define oRAX 144
+#define oRCX 152
+#define oRIP 168
+#define oEFL 176
+#define oFPREGS 224
+#define oSIGMASK 296
+#define oFPREGSMEM 424
+#define oMXCSR 448
+```
+
+
+### lightweight_getcontext
+
+轻量级的 getcontext 实现
+
+```c
+lightweight_getcontext.S
+#include "ucontext_i.h"
+
+
+.globl lightweight_getcontext
+lightweight_getcontext:
+	/* Save the preserved registers, the registers used for passing
+	   args, and the return address.  */
+	movq	%rbx, oRBX(%rdi)
+	movq	%rbp, oRBP(%rdi)
+	movq	%r12, oR12(%rdi)
+	movq	%r13, oR13(%rdi)
+	movq	%r14, oR14(%rdi)
+	movq	%r15, oR15(%rdi)
+
+	movq	%rdi, oRDI(%rdi)
+	movq	%rsi, oRSI(%rdi)
+	movq	%rdx, oRDX(%rdi)
+	movq	%rcx, oRCX(%rdi)
+	movq	%r8, oR8(%rdi)
+	movq	%r9, oR9(%rdi)
+
+	movq	(%rsp), %rcx
+	movq	%rcx, oRIP(%rdi)
+	leaq	8(%rsp), %rcx		/* Exclude the return address.  */
+	movq	%rcx, oRSP(%rdi)
+
+	/* We have separate floating-point register content memory on the
+	   stack.  We use the __fpregs_mem block in the context.  Set the
+	   links up correctly.  */
+	leaq	oFPREGSMEM(%rdi), %rcx
+	movq	%rcx, oFPREGS(%rdi)
+	/* Save the floating-point environment.  */
+	fnstenv	(%rcx)
+	stmxcsr oMXCSR(%rdi)
+
+	/* Formerly here: a call to sigprocmask.
+	   Deleted because unnecessary for our application. */
+
+	/* All done, return 0 for success.  */
+	xorl	%eax, %eax
+	ret
+```
+
+
+### lightweight_swapcontext
+
+轻量级的 swapcontext 实现，移除了注册信号的系统调用
+
+```c
+#include "ucontext_i.h"
+
+
+.globl lightweight_swapcontext
+lightweight_swapcontext:
+	/* Save the preserved registers, the registers used for passing args,
+	   and the return address.  */
+	movq	%rbx, oRBX(%rdi)
+	movq	%rbp, oRBP(%rdi)
+	movq	%r12, oR12(%rdi)
+	movq	%r13, oR13(%rdi)
+	movq	%r14, oR14(%rdi)
+	movq	%r15, oR15(%rdi)
+
+	/* Don't bother saving  and restoring argument registers */
+	movq	%rdi, oRDI(%rdi)
+	movq	%rsi, oRSI(%rdi)
+	movq	%rdx, oRDX(%rdi)
+	movq	%rcx, oRCX(%rdi)
+	movq	%r8, oR8(%rdi)
+	movq	%r9, oR9(%rdi)
+
+	movq	(%rsp), %rcx
+	movq	%rcx, oRIP(%rdi)
+	leaq	8(%rsp), %rcx		/* Exclude the return address.  */
+	movq	%rcx, oRSP(%rdi)
+
+
+	/* We have separate floating-point register content memory on the
+	   stack.  We use the __fpregs_mem block in the context.  Set the
+	   links up correctly.  */
+	leaq	oFPREGSMEM(%rdi), %rcx
+	movq	%rcx, oFPREGS(%rdi)
+	/* Save the floating-point environment.  */
+	fnstenv	(%rcx)
+	stmxcsr oMXCSR(%rdi)
+
+	/* Formerly here: a call to sigprocmask.
+	   Deleted because unnecessary for our application. */
+
+	/* Restore the floating-point context.  Not the registers, only the
+	   rest.  */
+	movq	oFPREGS(%rsi), %rcx
+	fldenv	(%rcx)
+	ldmxcsr oMXCSR(%rsi)
+
+	/* Load the new stack pointer and the preserved registers.  */
+	movq	oRSP(%rsi), %rsp
+	movq	oRBX(%rsi), %rbx
+	movq	oRBP(%rsi), %rbp
+	movq	oR12(%rsi), %r12
+	movq	oR13(%rsi), %r13
+	movq	oR14(%rsi), %r14
+	movq	oR15(%rsi), %r15
+
+	/* The following ret should return to the address set with
+	getcontext.  Therefore push the address on the stack.  */
+	movq	oRIP(%rsi), %rcx
+	pushq	%rcx
+
+	/* Setup registers used for passing args--don't bother with this  */
+	movq	oRDI(%rsi), %rdi
+	movq	oRDX(%rsi), %rdx
+	movq	oRCX(%rsi), %rcx
+	movq	oR8(%rsi), %r8
+	movq	oR9(%rsi), %r9
+
+	/* Setup finally  %rsi.  */
+	movq	oRSI(%rsi), %rsi
+
+	/* Clear rax to indicate success.  */
+	xorl	%eax, %eax
+	ret
+```
 
 
 ## References
