@@ -159,7 +159,7 @@ fn main() -> anyhow::Result<()> {
 
 以上，`fragtop-rs` 的代码完成了。
 
-用它来查看 `/var/log/` 目录下面的所有日志文件，并根据碎片大小输出
+用它来查看 `/var/log/` 目录下面的所有日志文件，并根据碎片数量输出
 
 ```shell
 $ ./target/debug/fragtop-rs -p '/var/log/**/*'
