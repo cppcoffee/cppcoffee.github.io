@@ -265,8 +265,10 @@ lightweight_getcontext.S
 #include "ucontext_i.h"
 
 
-.globl lightweight_getcontext
+.globl lightweight_getcontext;
+.type lightweight_getcontext, @function;
 lightweight_getcontext:
+.cfi_startproc;
 	/* Save the preserved registers, the registers used for passing
 	   args, and the return address.  */
 	movq	%rbx, oRBX(%rdi)
@@ -303,6 +305,7 @@ lightweight_getcontext:
 	/* All done, return 0 for success.  */
 	xorl	%eax, %eax
 	ret
+.cfi_endproc;
 ```
 
 
@@ -314,8 +317,10 @@ lightweight_getcontext:
 #include "ucontext_i.h"
 
 
-.globl lightweight_swapcontext
+.globl lightweight_swapcontext;
+.type lightweight_swapcontext, @function;
 lightweight_swapcontext:
+.cfi_startproc;
 	/* Save the preserved registers, the registers used for passing args,
 	   and the return address.  */
 	movq	%rbx, oRBX(%rdi)
@@ -384,6 +389,7 @@ lightweight_swapcontext:
 	/* Clear rax to indicate success.  */
 	xorl	%eax, %eax
 	ret
+.cfi_endproc
 ```
 
 
