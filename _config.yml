@@ -30,6 +30,7 @@ github_username:  cppcoffee
 
 # Build settings
 theme: minima
+  skin: dark
 permalink: pretty
 plugins:
   - jekyll-feed
